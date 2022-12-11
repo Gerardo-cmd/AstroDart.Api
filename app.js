@@ -24,7 +24,7 @@ app.use(express.json());
 app.use(cors({
     origin: ['http://localhost:3000'],
     allowedHeaders: ['Content-Type', 'Authorization'],
-    methods: ['GET, POST', 'DELETE'],
+    methods: ['GET, POST', 'PUT', 'DELETE'],
     optionsSuccessStatus: 200
 }));
 
@@ -67,11 +67,9 @@ const client = new PlaidApi(configuration);
 
 app.get('/api/info', function (req, res) {
   res.status(200).send({
-    "data": {
-      item_id: ITEM_ID,
-      access_token: ACCESS_TOKEN,
-      products: process.env.PLAID_PRODUCTS,
-    }
+    item_id: ITEM_ID,
+    access_token: ACCESS_TOKEN,
+    products: process.env.PLAID_PRODUCTS,
   });
 });
 
@@ -105,13 +103,13 @@ app.post('/api/create_link_token', (req, res, next) => {
         configs.android_package_name = PLAID_ANDROID_PACKAGE_NAME;
       }
       const createTokenResponse = await client.linkTokenCreate(configs);
-      res.status(200).send({
-        "data": createTokenResponse.data
-      });
+      res.status(200).send(
+        createTokenResponse.data
+      );
     })
     .catch((error) => {
-      console.log("Here is the error below!");
-      console.log(error)
+      console.error("Here is the error below!");
+      console.error(error)
       next();
     });
 });
@@ -176,7 +174,7 @@ app.post("/api/login", async (req, res) => {
   
   const item = await dynamodb.getItem(getParams, (err, data) => {
     if (err) {
-      console.log("Error when getting item:", err);
+      console.error("Error when getting item:", err);
       return undefined;
     } else {
       return data.Item;
@@ -206,7 +204,7 @@ app.post("/api/login", async (req, res) => {
         firstName: item.Item.FirstName?.S,
         lastName: item.Item.LastName?.S,
         checklist: item.Item.Checklist?.M,
-        items: item.Item.LinkedItems?.M,
+        items: item.Item.LinkedItems?.M || {},
       }
     });
   }
@@ -214,7 +212,7 @@ app.post("/api/login", async (req, res) => {
 
 // Uses DynamoDB
 // An endpoint for creating new users
-app.post('/api/new-user', async (req, res) => {
+app.put('/api/user', async (req, res) => {
   if (!req.body.email || !req.body.password || !req.body.firstName || !req.body.lastName) {
     res.status(400).send({
       "msg": "Must include all necessary info!"
@@ -233,7 +231,7 @@ app.post('/api/new-user', async (req, res) => {
   
   const item = await dynamodb.getItem(getParams, (err, data) => {
     if (err) {
-      console.log("Error when getting item:", err);
+      console.error("Error when getting item:", err);
       return undefined;
     } else {
       return data.Item;
@@ -242,7 +240,7 @@ app.post('/api/new-user', async (req, res) => {
 
   if (Object.keys(item).length !== 0) {
     res.status(200).send({
-      "msg": "There is already an accont registered with this email!"
+      "msg": "There is already an account registered with this email!"
     });
     return;
   }
@@ -263,7 +261,7 @@ app.post('/api/new-user', async (req, res) => {
 
   const successful = await dynamodb.putItem(putParams, (err, data) => {
     if (err) {
-      console.log("Error encountered:", err);
+      console.error("Error encountered:", err);
       return false;
     } else {
       return true;
@@ -274,14 +272,95 @@ app.post('/api/new-user', async (req, res) => {
     res.status(500).send({
       "msg": "Error when creating the account!"
     });
+    return;
   }
   else {
     const token = jwt.sign(req.body.email, process.env.SECRET);
     res.status(200).send({
       "data": {
-        token
+        token,
+        firstName: req.body.firstName,
+        lastName: req.body.lastName,
+        checklist: {},
+        items: {},
       }
     });
+    return;
+  }
+});
+
+
+// Uses DynamoDB
+// An endpoint for creating new users
+app.delete('/api/user', async (req, res) => {
+  if (!req.body.email || !req.body.password) {
+    res.status(400).send({
+      "msg": "Must include email and password!"
+    });
+    return;
+  }
+
+  const getParams = {
+    TableName: "AstroDart.Users",
+    Key: {
+      "UserId": {
+        S: req.body.email
+      }
+    }
+  };
+  
+  const item = await dynamodb.getItem(getParams, (err, data) => {
+    if (err) {
+      console.error("Error when getting item:", err);
+      return undefined;
+    } else {
+      return data.Item;
+    }
+  }).promise();
+
+  if (Object.keys(item).length === 0) {
+    res.status(200).send({
+      "msg": "There is not an account registered with this email"
+    });
+    return;
+  }
+
+  const shaObj = new jsSHA("SHA-512", "TEXT", { encoding: "UTF8" });
+  const hashedPassword = shaObj.update(req.body.password).getHash("HEX");
+  const deleteParams = {
+    TableName: 'AstroDart.Users',
+    Key: {
+      "UserId": {"S": req.body.email}
+    }
+  };
+
+  if (hashedPassword !== item.Item.Password.S) {
+    res.status(200).send({
+      "msg": "Invalid credentials"
+    });
+    return;
+  }
+
+  const successful = await dynamodb.deleteItem(deleteParams, (err, data) => {
+    if (err) {
+      console.error("Error encountered:", err);
+      return false;
+    } else {
+      return true;
+    }
+  }).promise();
+
+  if (!successful) {
+    res.status(500).send({
+      "msg": "Error when deleting the account!"
+    });
+    return;
+  }
+  else {
+    res.status(200).send({
+      "msg": "Account deleted"
+    });
+    return;
   }
 });
 
@@ -306,7 +385,7 @@ app.post('/api/checklist', async (req, res) => {
   
   const item = await dynamodb.getItem(getParams, (err, data) => {
     if (err) {
-      console.log("Error when getting user:", err);
+      console.error("Error when getting user:", err);
       return undefined;
     } else {
       return data.Item;
@@ -333,7 +412,7 @@ app.post('/api/checklist', async (req, res) => {
 
   const successful = await dynamodb.updateItem(updateParams, (err, data) => {
     if (err) {
-      console.log("Error encountered:", err);
+      console.error("Error encountered:", err);
       return false;
     } else {
       return true;
@@ -373,7 +452,7 @@ app.post('/api/items', async (req, res) => {
   
   const item = await dynamodb.getItem(getParams, (err, data) => {
     if (err) {
-      console.log("Error when getting user:", err);
+      console.error("Error when getting user:", err);
       return undefined;
     } else {
       return data.Item;
@@ -400,7 +479,7 @@ app.post('/api/items', async (req, res) => {
 
   const successful = await dynamodb.updateItem(updateParams, (err, data) => {
     if (err) {
-      console.log("Error encountered:", err);
+      console.error("Error encountered:", err);
       return false;
     } else {
       return true;
