@@ -9,8 +9,23 @@ import {
   Configuration,
   PlaidApi,
   Products,
-  PlaidEnvironments
+  PlaidEnvironments, 
 } from "plaid";
+import cron from "node-cron";
+
+/** Plaid Endpoint Imports */
+import getAuth from './PlaidEndpoints/GetAuth.js';
+import getBalance from './PlaidEndpoints/GetBalance.js';
+import getInvestments from './PlaidEndpoints/GetInvestments.js';
+import getLiabilities from './PlaidEndpoints/GetLiabilities.js';
+import getTransactions from './PlaidEndpoints/GetTransactions.js';
+
+/** Custom Endpoint Imports */
+import login from './CustomEndpoints/Login.js';
+import createUser from './CustomEndpoints/CreateUser.js';
+import deleteUser from './CustomEndpoints/DeleteUser.js';
+
+import { getAccountsArray } from "./utils.js";
 
 const app = express();
 
@@ -65,6 +80,362 @@ const configuration = new Configuration({
 
 const client = new PlaidApi(configuration);
 
+const saveMonthlySpendingForAllUsers = async () => {
+  const date = new Date();
+  const params = {
+    TableName: "AstroDart.Users",
+  };
+  const users = [];
+  let items;
+
+  do{
+    items = await dynamodb.scan(params).promise();
+    items.Items.forEach((item) => users.push(item));
+    params.ExclusiveStartKey  = items.LastEvaluatedKey;
+  }while(typeof items.LastEvaluatedKey !== "undefined");
+
+  const userPromiseArray = [];
+  users.map((user) => {
+    const email = user.UserId.S;
+    userPromiseArray.push(new Promise(async (resolve, reject) => {
+      try {
+        const getParams = {
+          TableName: "AstroDart.Users",
+          Key: {
+            "UserId": {
+              S: email
+            }
+          }
+        };
+        
+        const userItem = await dynamodb.getItem(getParams, (err, data) => {
+          if (err) {
+            console.error("Error when getting user:", err);
+            return undefined;
+          } else {
+            return data.Item;
+          }
+        }).promise();
+
+        // Remember to get the data from the previous month
+        const transactions = await getTransactionsForUser(dynamodb, client, email, true);
+        // Sum up transactions to get total for each category as well as total overall
+        const categoriesObject = {};
+        const categories = new Map();
+
+        transactions.forEach((transaction) => {
+          const category = transaction.category[0] === "Payment" && transaction.category.length > 1 ? transaction.category[1] : transaction.category[0]
+          if (categories.has(category))  {
+            const oldValue = categories.get(category);
+            categories.set(category, oldValue + transaction.amount);
+          }
+          else {
+            categories.set(category, transaction.amount);
+          }
+        });
+      
+        let total = 0;
+        categories.forEach((amount, category) => {
+          categoriesObject[category] = { "M": {
+            "Amount": { "N": amount.toString()},
+            "Category": { "S": category } 
+          }};
+          total += amount;
+        });
+        categoriesObject["Overall"] = { "N": total.toString() };
+
+        // Save data in the database
+        const monthlySpendingKeys = Object.keys(userItem.Item.MonthlySpending?.M);
+        
+        let newMonthlySpending;
+        // We only want the previous two months, so if we have already have two, 
+        // then create the new one while getting rid of the oldest one
+        if (monthlySpendingKeys.length === 2) {
+          newMonthlySpending = {};
+          newMonthlySpending["0"] = userItem.Item.MonthlySpending.M["1"];
+          // Remember that we are using last month's data
+          newMonthlySpending["1"] = {
+            "M": {
+              "Date": { "S": (date.getMonth()) + "-" + date.getFullYear() },
+              "Spending": { 
+                "M": categoriesObject 
+              }
+            }
+          };
+        }
+        // If there is 1 month or no data recorded
+        else {
+          newMonthlySpending = userItem.Item.MonthlySpending.M;
+          // Remember that we are using last month's data
+          newMonthlySpending[monthlySpendingKeys.length.toString()] = {
+            "M": {
+              "Date": { "S": (date.getMonth()) + "-" + date.getFullYear() },
+              "Spending": { 
+                "M": categoriesObject 
+              }
+            } 
+          };
+        }
+
+        const updateParams = {
+          TableName: 'AstroDart.Users',
+          Key: {
+            "UserId": {"S": email}
+          },
+          UpdateExpression: "set MonthlySpending = :x",
+          ExpressionAttributeValues: {
+            ":x": { 
+              "M": newMonthlySpending 
+            }
+          }
+        };
+      
+        const successful = await dynamodb.updateItem(updateParams, (err, data) => {
+          if (err) {
+            console.error("Error encountered:", err);
+            return false;
+          } else {
+            return true;
+          }
+        }).promise();
+        resolve(successful);
+      } catch (error) {
+        console.error("There was an error when getting the transactions for one user. The error is below.");
+        console.error(error);
+      }
+    }));
+  });
+
+  Promise.all(userPromiseArray).then((results) => {
+    console.log("Successfully saved monthly spending totals for all users");
+  }).catch((error) => {
+    console.error("Something went wrong when saving monthly spending amounts for all users. None were saved as a result. The error is below");
+    console.error(error);
+  });
+};
+
+const updateAllBalances = async () => {
+  // Go through every user
+  const params = {
+    TableName: "AstroDart.Users",
+  };
+
+  const userPromiseArray = [];
+  const users = [];
+  let items;
+
+  do{
+    items =  await dynamodb.scan(params).promise();
+    items.Items.forEach((item) => users.push(item));
+    params.ExclusiveStartKey  = items.LastEvaluatedKey;
+  }while(typeof items.LastEvaluatedKey !== "undefined");
+
+  // Go through every item
+  users.map((user) => {
+    const userId = user.UserId.S;
+    const itemPromiseArray = [];
+    const itemKeys = Object.keys(user.LinkedItems.M);
+
+    const newItems = user.LinkedItems.M;
+
+    itemKeys.forEach((item) => {
+      // Call the api/balance/get endpoint below to get the latest balances
+      const accessToken = user.LinkedItems.M[item].M.access_token.S;
+      const accountKeys = Object.keys(user.LinkedItems.M[item].M.accounts.M);
+      const itemId = user.LinkedItems.M[item].M.item_id.S;
+      const institutionId = user.LinkedItems.M[item].M.institution_id.S;
+      const product = user.LinkedItems.M[item].M.product.S;
+
+      itemPromiseArray.push(new Promise(async (resolve, reject) => {
+        const request = {
+          access_token: accessToken,
+        };
+        const response = await client.accountsBalanceGet(request);
+        const accounts = response.data.accounts;
+
+        const getParams = {
+          TableName: "AstroDart.Users",
+          Key: {
+            "UserId": {
+              S: userId
+            }
+          }
+        };
+
+        const accountsForThisItem = {};
+        accounts.forEach((account) => {
+          // Only copy the current balance if it exists in the user's data. Otherwise, skip over it
+          if (accountKeys.includes(account.account_id)) {
+            accountsForThisItem[account.account_id] = {
+              M: {
+                accountId: { S: account.account_id},
+                name: { S: account.name},
+                balance: { N: account.balances.current.toString()},
+                item_id: { S: itemId },
+                type: { S: account.type}
+              }
+            };
+          }
+        });
+
+        // Update the value with the new accounts but keep everything else tha same
+        newItems[itemId] = {
+          M: {
+            institution_id: { S: institutionId },
+            access_token: { S: accessToken },
+            item_id: { S: itemId },
+            accounts: { M: accountsForThisItem },
+            product: { S: product }
+          }
+        };
+        const updateParams = {
+          TableName: 'AstroDart.Users',
+          Key: {
+            "UserId": { "S": userId }
+          },
+          UpdateExpression: "set LinkedItems = :x",
+          ExpressionAttributeValues: {
+            ":x": { "M": newItems }
+          }
+        };
+      
+        const successful = await dynamodb.updateItem(updateParams, (err, data) => {
+          if (err) {
+            console.error("Error encountered:", err);
+            return false;
+          } else {
+            return true;
+          }
+        }).promise();
+  
+        resolve(successful);
+      }));
+    });
+
+    userPromiseArray.push(itemPromiseArray);
+  });
+
+  for (let index = 0; index < userPromiseArray.length; index++) {
+    // Iterate over every user
+    const promiseArray = userPromiseArray[index];
+    // Complete the promise array for the current user
+    Promise.all(promiseArray).then((results) => {
+      console.log("Successfully updated all balances for one user")
+    }).catch((error) => {
+      console.error("Something went wrong when updating all balances. None were updated as a result. The error is below");
+      console.error(error);
+    });
+  }
+};
+
+const getNetworth = async () => {
+  const date = new Date();
+  const params = {
+    TableName: "AstroDart.Users",
+  };
+  const promiseArray = [];
+  const users = [];
+  let items;
+
+  do{
+    items = await dynamodb.scan(params).promise();
+    items.Items.forEach((item) => users.push(item));
+    params.ExclusiveStartKey  = items.LastEvaluatedKey;
+  }while(typeof items.LastEvaluatedKey !== "undefined");
+
+  users.map((user) => {
+    let currentNetworth = 0;
+    const items = user.LinkedItems?.M;
+
+    // Will return an empty array if there are no items
+    const accountsArray = getAccountsArray(items);
+    accountsArray.forEach((account) => {
+      let accountBalance = parseFloat(account.balance.N);
+      if (account.type.S === "credit") {
+        accountBalance *= -1;
+      }
+      currentNetworth += accountBalance;
+    });
+
+    promiseArray.push(new Promise(async (resolve, reject) => {
+      const getParams = {
+        TableName: "AstroDart.Users",
+        Key: {
+          "UserId": {
+            S: user.UserId.S
+          }
+        }
+      };
+      
+      const userItem = await dynamodb.getItem(getParams, (err, data) => {
+        if (err) {
+          console.error("Error when getting user:", err);
+          return undefined;
+        } else {
+          return data.Item;
+        }
+      }).promise();
+
+      const networthHistoryKeys = Object.keys(userItem.Item.NetworthHistory?.M);
+      const newNetworthHistory = userItem.Item.NetworthHistory.M;
+      newNetworthHistory[networthHistoryKeys.length.toString()] = {
+        "M": {
+          "Date": { "S": (date.getMonth() + 1) + "-" + date.getFullYear() },
+          "Networth": { "N": Math.floor(currentNetworth).toString() }
+        } 
+      };
+
+      const updateParams = {
+        TableName: 'AstroDart.Users',
+        Key: {
+          "UserId": {"S": user.UserId.S}
+        },
+        UpdateExpression: "set NetworthHistory = :x",
+        ExpressionAttributeValues: {
+          ":x": { 
+            "M": newNetworthHistory
+          }
+        }
+      };
+    
+      const successful = await dynamodb.updateItem(updateParams, (err, data) => {
+        if (err) {
+          console.error("Error encountered:", err);
+          return false;
+        } else {
+          return true;
+        }
+      }).promise();
+
+      resolve(successful);
+    }));
+  });
+
+  Promise.all(promiseArray).then((results) => {
+    console.log(`Successfully updated all user's networths!`);
+  })
+  .catch((error) => {
+    console.error("Something went wrong when saving the networth of each user. As a result, none were saved. The error is below.");
+    console.log(error);
+  });
+};
+
+cron.schedule('0 9 1 * *', () => {
+  console.log('Marking all users\'s networth At 09:00 AM on the first day of every month');
+  getNetworth();
+});
+
+cron.schedule('0 8,17 * * *', () => {
+  console.log('Updating all balances At 08:00 AM and 5:00 PM every day');
+  updateAllBalances();
+});
+
+// Read whole table, read each user once, and write to each user once Change this to reade the data from last month!
+cron.schedule('0 1 1 * *', () => {
+  console.log('Marking all users\'s networth At 01:00 AM on the first day of every month');
+  saveMonthlySpendingForAllUsers();
+});
+
 app.get('/api/info', function (req, res) {
   res.status(200).send({
     item_id: ITEM_ID,
@@ -75,7 +446,7 @@ app.get('/api/info', function (req, res) {
 
 // Creates a link token in oder to initialize Plaid Link client-side. Ideally used every log in.
 app.post('/api/create_link_token', (req, res, next) => {
-  if (!req.body.userToken) {
+  if (!req.body.userToken || !req.body.type) {
     res.status(400).send({
       "msg": "Need to provide the userToken"
     });
@@ -84,13 +455,17 @@ app.post('/api/create_link_token', (req, res, next) => {
 
   Promise.resolve()
     .then(async () => {
+      const products = [req.body.type];
+      if (req.body.type === "auth" || req.body.type === "liabilities") {
+        products.push('transactions');
+      }
       const configs = {
         user: {
           // This should correspond to a unique id for the current user.
           client_user_id: req.body.userToken,
         },
         client_name: 'AstroDart Sandbox',
-        products: PLAID_PRODUCTS,
+        products: products,
         country_codes: PLAID_COUNTRY_CODES,
         language: 'en',
       };
@@ -110,7 +485,7 @@ app.post('/api/create_link_token', (req, res, next) => {
     .catch((error) => {
       console.error("Here is the error below!");
       console.error(error)
-      next();
+      next(error);
     });
 });
 
@@ -141,20 +516,87 @@ app.post('/api/set_access_token', (req, res, next) => {
     .catch(next);
 });
 
-
-// Retrieve data on an item's accounts
-app.post('/api/auth', (req, res, next) => {
-  Promise.resolve()
-    .then(async () => {
-      const authResponse = await client.authGet({
-        access_token: req.body.accessToken || ACCESS_TOKEN,
-      });
-      res.status(200).send(authResponse.data);
-    })
-    .catch(next);
+/** Plaid Endpoints */
+// Retrieve data on an item's accounts. 
+app.post('/api/auth', async (req, res) => {
+  try {
+    const data = await getAuth(client, req.body.accessToken);
+    res.status(200).send(data);
+    return;
+  } catch (error) {
+    res.status(500).send(error);
+  }
 });
 
-// Uses DynamoDB
+app.post('/api/balance', async (req, res) => {
+  if (!req.body.accessToken) {
+    res.status(400).send({
+      "msg": "Need accessToken"
+    });
+    return;
+  }
+    try {
+      const accounts = await getBalance(client, req.body.acccessToken);
+      res.status(200).send(accounts);
+    } catch (error) {
+      res.status(500).send(error);
+    }
+}); 
+
+// Get transactions for all accounts that are depository or credit
+app.post('/api/transactions', async (req, res) => {
+  if (!req.body.email) {
+    res.status(400).send({
+      "msg": "Need email"
+    });
+  }
+  const transactions = await getTransactionsForUser(dynamodb, client, req.body.email);
+  res.status(200).send(transactions);
+});
+
+app.get('/api/categories', async (req, res) => {
+  try {
+    const response = await client.categoriesGet({});
+    const categories = response.data.categories;
+    res.status(200).send(categories);
+  } catch (error) {
+    res.status(500).send(error);
+  }
+})
+
+app.post('/api/liabilities', async (req, res) => {
+  if (!req.body.accessToken) {
+    res.status(400).send({
+      "msg": "Need accessToken"
+    });
+    return;
+  }
+  try {
+    const liabilities = await getLiabilities(client, req.body.accessToken);
+    res.status(200).send(liabilities);
+    return;
+  } catch (error) {
+    res.status(500).send(error);
+  }
+});
+
+app.post('/api/investments', async (req, res) => {
+  if (!req.body.accessToken) {
+    res.status(400).send({
+      "msg": "Need accessToken"
+    });
+    return;
+  }
+  try {
+    const invetments = await getInvestments(client, req.body.accessToken);
+    res.status(200).send(invetments);
+    return;
+  } catch (error) {
+    res.status(500).send(error)
+  }
+});
+
+/** Custom Endpoints */
 // An endpoint for logging in and verifying credentials
 app.post("/api/login", async (req, res) => {
   if (!req.body.email || !req.body.password) {
@@ -162,55 +604,23 @@ app.post("/api/login", async (req, res) => {
       "msg": "Need email and password"
     });
   }
-  
-  const getParams = {
-    TableName: "AstroDart.Users",
-    Key: {
-      "UserId": {
-        S: req.body.email
-      }
+  try {
+    const data = await login(dynamodb, req.body.email, req.body.password);
+    if (data === "Invalid Credentials") {
+      res.status(200).send({
+        "msg": "Invalid Credentials"
+      });
+      return;
     }
-  };
-  
-  const item = await dynamodb.getItem(getParams, (err, data) => {
-    if (err) {
-      console.error("Error when getting item:", err);
-      return undefined;
-    } else {
-      return data.Item;
-    }
-  }).promise();
-
-  if (Object.keys(item).length === 0) {
-    res.status(200).send({
-      "msg": "There is not an account registered with this email!"
-    });
-    return;
-  }
-
-  const shaObj = new jsSHA("SHA-512", "TEXT", { encoding: "UTF8" });
-  const hashedPassword = shaObj.update(req.body.password).getHash("HEX");
-
-  if (hashedPassword !== item.Item.Password.S) {
-    res.status(200).send({
-      "msg": "Incorrect Password"
-    });
-  }
-  else {
-    const token = jwt.sign(req.body.email, process.env.SECRET);
-    res.status(200).send({
-      "data": {
-        token,
-        firstName: item.Item.FirstName?.S,
-        lastName: item.Item.LastName?.S,
-        checklist: item.Item.Checklist?.M,
-        items: item.Item.LinkedItems?.M || {},
-      }
+    res.status(200).send(data);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({
+      "msg": "Something went wrong in the server when trying to login. Please try again later."
     });
   }
 });
 
-// Uses DynamoDB
 // An endpoint for creating new users
 app.put('/api/user', async (req, res) => {
   if (!req.body.email || !req.body.password || !req.body.firstName || !req.body.lastName) {
@@ -220,78 +630,25 @@ app.put('/api/user', async (req, res) => {
     return;
   }
 
-  const getParams = {
-    TableName: "AstroDart.Users",
-    Key: {
-      "UserId": {
-        S: req.body.email
-      }
+  try {
+    const data = await createUser(dynamodb, req.body.email, req.body.password, req.body.firstName, req.body.lastName);
+    if (data === "Duplicate Account") {
+      res.status(200).send({
+        "msg": "There is already an account with this email"
+      });
+      return;
     }
-  };
-  
-  const item = await dynamodb.getItem(getParams, (err, data) => {
-    if (err) {
-      console.error("Error when getting item:", err);
-      return undefined;
-    } else {
-      return data.Item;
-    }
-  }).promise();
 
-  if (Object.keys(item).length !== 0) {
-    res.status(200).send({
-      "msg": "There is already an account registered with this email!"
-    });
-    return;
-  }
-
-  const shaObj = new jsSHA("SHA-512", "TEXT", { encoding: "UTF8" });
-  const hashedPassword = shaObj.update(req.body.password).getHash("HEX");
-  const putParams = {
-    TableName: 'AstroDart.Users',
-    Item: {
-      "UserId": {"S": req.body.email},
-      "FirstName": {"S": req.body.firstName},
-      "LastName": {"S": req.body.lastName},
-      "Password": {"S": hashedPassword},
-      "Checklist": {"M": {}},
-      "LinkedItems": {"M": {}}
-    }
-  };
-
-  const successful = await dynamodb.putItem(putParams, (err, data) => {
-    if (err) {
-      console.error("Error encountered:", err);
-      return false;
-    } else {
-      return true;
-    }
-  }).promise();
-
-  if (!successful) {
+    res.status(200).send(data);
+  } catch (error) {
     res.status(500).send({
-      "msg": "Error when creating the account!"
+      "msg": "Something went wrong in the server. Error: " + error
     });
-    return;
-  }
-  else {
-    const token = jwt.sign(req.body.email, process.env.SECRET);
-    res.status(200).send({
-      "data": {
-        token,
-        firstName: req.body.firstName,
-        lastName: req.body.lastName,
-        checklist: {},
-        items: {},
-      }
-    });
-    return;
   }
 });
 
 
-// Uses DynamoDB
-// An endpoint for creating new users
+// An endpoint for deleting users
 app.delete('/api/user', async (req, res) => {
   if (!req.body.email || !req.body.password) {
     res.status(400).send({
@@ -299,73 +656,43 @@ app.delete('/api/user', async (req, res) => {
     });
     return;
   }
-
-  const getParams = {
-    TableName: "AstroDart.Users",
-    Key: {
-      "UserId": {
-        S: req.body.email
-      }
+  try {
+    const data = await deleteUser(dynamodb, req.body.email, req.body.password);
+    if (data === "Error getting account") {
+      res.status(500).send({
+        "msg": "There was an error in the server when trying to pull up the account. Please try again later."
+      });
+      return;
     }
-  };
-  
-  const item = await dynamodb.getItem(getParams, (err, data) => {
-    if (err) {
-      console.error("Error when getting item:", err);
-      return undefined;
-    } else {
-      return data.Item;
+    else if (data === "Invalid Credentials") {
+      res.status(200).send({
+        "msg": "Invalid credentials"
+      });
+      return;
     }
-  }).promise();
-
-  if (Object.keys(item).length === 0) {
-    res.status(200).send({
-      "msg": "There is not an account registered with this email"
-    });
-    return;
-  }
-
-  const shaObj = new jsSHA("SHA-512", "TEXT", { encoding: "UTF8" });
-  const hashedPassword = shaObj.update(req.body.password).getHash("HEX");
-  const deleteParams = {
-    TableName: 'AstroDart.Users',
-    Key: {
-      "UserId": {"S": req.body.email}
+    else if (data === "Error deleting account") {
+      res.status(500).send({
+        "msg": "There was an error in the server when trying to delete your account from the database. Please try again later."
+      });
+      return;
     }
-  };
-
-  if (hashedPassword !== item.Item.Password.S) {
-    res.status(200).send({
-      "msg": "Invalid credentials"
-    });
-    return;
-  }
-
-  const successful = await dynamodb.deleteItem(deleteParams, (err, data) => {
-    if (err) {
-      console.error("Error encountered:", err);
-      return false;
-    } else {
-      return true;
+    else if (data) {
+      res.status(200).send({
+        "msg": "Account deleted"
+      });
+      return;
     }
-  }).promise();
-
-  if (!successful) {
+    else {
+      throw new Error("Something weird happened");
+    }
+  } catch (error) {
     res.status(500).send({
-      "msg": "Error when deleting the account!"
+      "msg": "Something went wrong in the server. " + error
     });
-    return;
-  }
-  else {
-    res.status(200).send({
-      "msg": "Account deleted"
-    });
-    return;
   }
 });
 
-// Uses DynamoDB
-// An endpoint for updating the checklist
+// An endpoint for updating a user's checklist
 app.post('/api/checklist', async (req, res) => {
   if (!req.body.email || !req.body.checklist) {
     res.status(400).send({
@@ -431,8 +758,7 @@ app.post('/api/checklist', async (req, res) => {
   }
 });
 
-// Uses DynamoDB
-// An endpoint for updating the items a user has
+// An endpoint for updating a user's items
 app.post('/api/items', async (req, res) => {
   if (!req.body.email || !req.body.items) {
     res.status(400).send({
@@ -461,7 +787,7 @@ app.post('/api/items', async (req, res) => {
 
   if (Object.keys(item).length === 0) {
     res.status(200).send({
-      "msg": "There is already an accont registered with this email!"
+      "msg": "Could not find account with this email"
     });
     return;
   }
@@ -499,6 +825,64 @@ app.post('/api/items', async (req, res) => {
 });
 
 app.listen(process.env.PORT || 5000, () => console.log("server starting on port 5000!"));
+
+const getTransactionsForUser = async (dynamodb, client, email, previousMonth = false) => {
+  const getParams = {
+    TableName: "AstroDart.Users",
+    Key: {
+      "UserId": {
+        S: email
+      }
+    }
+  };
+  
+  const item = await dynamodb.getItem(getParams, (err, data) => {
+    if (err) {
+      console.error("Error when getting item:", err);
+      return undefined;
+    } else {
+      return data.Item;
+    }
+  }).promise();
+
+  const linkedItems = item.Item.LinkedItems.M;
+  const promiseArray = [];
+  const itemKeys = Object.keys(linkedItems);
+  itemKeys.forEach((itemKey) => {
+    const accessToken = linkedItems[itemKey].M.access_token.S;
+    if (linkedItems[itemKey].M.product.S === "auth" || linkedItems[itemKey].M.product.S === "liabilities") {
+      promiseArray.push(new Promise(async (resolve, reject) => {
+        try {
+          const transactions = await getTransactions(client, accessToken, previousMonth);
+          resolve(transactions);
+        } catch (error) {
+          console.error("Error occured when getting the transactions. The error is below.");
+          console.error(error);
+        }
+      }));
+    }
+  });
+
+  const transactionsData = (await Promise.all(promiseArray)).flat();
+  // Go through all of transactions. If the account Id is not in the user's data or it's a credit card payment, then remove it from the data array
+  const accountsArray = getAccountsArray(linkedItems);
+  const accountKeys = [];
+  let userHasCreditAccount = false;
+  accountsArray.forEach((account) => {
+    switch (account.type.S) {
+      case 'credit':
+        userHasCreditAccount = true;
+      case 'depository':
+        accountKeys.push(account.accountId.S);
+        break;
+    }
+  });
+  const filteredTransactionsData = transactionsData.filter((transaction) => {
+    return userHasCreditAccount ? accountKeys.includes(transaction.account_id) && !transaction.category.includes("Credit Card") : accountKeys.includes(transaction.account_id);
+  });
+  const finalTransactionsData = filteredTransactionsData.sort((a, b) => Date.parse(b.date) - Date.parse(a.date));
+  return finalTransactionsData;
+};
 
 // This is a helper function to authorize and create a Transfer after successful
 // exchange of a public_token for an access_token. The TRANSFER_ID is then used

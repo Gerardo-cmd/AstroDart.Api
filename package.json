@@ -27,6 +27,7 @@
     "jsonwebtoken": "^8.5.1",
     "jssha": "^3.3.0",
     "md5": "^2.3.0",
+    "node-cron": "^3.0.2",
     "node-fetch": "^3.1.0",
     "plaid": "^12.1.0"
   }
