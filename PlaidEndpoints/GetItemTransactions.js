@@ -2,9 +2,9 @@
  * Will return the data for one item/account of any type (?). This is should mainly be used for depository accounts and credit card accounts.
  * @param {*} client PlaidApi
  * @param {*} accessToken String
- * @returns An array of transactions (objects) on the item/account. Is in reverse chronological order.
+ * @returns A promise to get an array of transactions (objects) on the item/account. Is in reverse chronological order.
  */
-const getTransactions = async (client, accessToken, getPreviousMonth = false) => {
+const getItemTransactions = async (client, accessToken, getPreviousMonth = false) => {
   const date = new Date();
   let year = date.getFullYear().toString();
   let month = date.getMonth() + 1 < 10 ? '0' + (date.getMonth() + 1).toString() : (date.getMonth() + 1).toString();
@@ -56,4 +56,4 @@ const getTransactions = async (client, accessToken, getPreviousMonth = false) =>
   }
 };
 
-export default getTransactions;
+export default getItemTransactions;

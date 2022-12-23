@@ -1,7 +1,15 @@
-import env from "dotenv";
 import jsSHA from "jssha";
 import jwt from "jsonwebtoken";
 
+/**
+ * Will create a new user and save the user to the database.
+ * @param {*} dynamodb AWS.DynamoDB
+ * @param {*} email String
+ * @param {*} password String
+ * @param {*} firstName String
+ * @param {*} lastName String
+ * @returns A promise to get either a string containing the result or an object with the respective data if the action was successful.
+ */
 const createUser = async (dynamodb, email, password, firstName, lastName) => {
   try {
     const getParams = {

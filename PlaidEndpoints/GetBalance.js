@@ -2,7 +2,7 @@
  * Will return the data for one item/account of any type. Mainly used to get the latest and updated balances for an account.
  * @param {*} client PlaidApi
  * @param {*} accessToken String
- * @returns An object containing data on the item/account
+ * @returns A promise to get an object containing data on the item/account
  */
 const getBalance = async (client, accessToken) => {
   try {

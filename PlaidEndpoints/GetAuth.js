@@ -2,7 +2,7 @@
  * Will return the data for one depository item/account. This is mainly for cash accounts.
  * @param {*} client PlaidApi
  * @param {*} accessToken String
- * @returns An object containing data on the item/account
+ * @returns A promise to get an object containing data on the item/account
  */
 const getAuth = async (client, accessToken) => {
   try {

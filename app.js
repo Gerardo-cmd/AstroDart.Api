@@ -2,8 +2,6 @@ import express from 'express';
 import cors from 'cors';
 
 import AWS from 'aws-sdk';
-import jsSHA from "jssha";
-import jwt from "jsonwebtoken";
 import env from "dotenv";
 import {
   Configuration,
@@ -18,12 +16,14 @@ import getAuth from './PlaidEndpoints/GetAuth.js';
 import getBalance from './PlaidEndpoints/GetBalance.js';
 import getInvestments from './PlaidEndpoints/GetInvestments.js';
 import getLiabilities from './PlaidEndpoints/GetLiabilities.js';
-import getTransactions from './PlaidEndpoints/GetTransactions.js';
+import getAllTransactionsForUser from './PlaidEndpoints/GetAllTransactionsForUser.js';
 
 /** Custom Endpoint Imports */
 import login from './CustomEndpoints/Login.js';
 import createUser from './CustomEndpoints/CreateUser.js';
 import deleteUser from './CustomEndpoints/DeleteUser.js';
+import updateUserChecklist from './CustomEndpoints/UpdateUserChecklist.js';
+import updateUserItems from './CustomEndpoints/UpdateUserItems.js';
 
 import { getAccountsArray } from "./utils.js";
 
@@ -118,7 +118,7 @@ const saveMonthlySpendingForAllUsers = async () => {
         }).promise();
 
         // Remember to get the data from the previous month
-        const transactions = await getTransactionsForUser(dynamodb, client, email, true);
+        const transactions = await getAllTransactionsForUser(dynamodb, client, email, true);
         // Sum up transactions to get total for each category as well as total overall
         const categoriesObject = {};
         const categories = new Map();
@@ -432,7 +432,7 @@ cron.schedule('0 8,17 * * *', () => {
 
 // Read whole table, read each user once, and write to each user once Change this to reade the data from last month!
 cron.schedule('0 1 1 * *', () => {
-  console.log('Marking all users\'s networth At 01:00 AM on the first day of every month');
+  console.log('Marking all users\'s spending for the previous month At 01:00 AM on the first day of every month');
   saveMonthlySpendingForAllUsers();
 });
 
@@ -550,8 +550,13 @@ app.post('/api/transactions', async (req, res) => {
       "msg": "Need email"
     });
   }
-  const transactions = await getTransactionsForUser(dynamodb, client, req.body.email);
-  res.status(200).send(transactions);
+  try {
+    const transactions = await getAllTransactionsForUser(dynamodb, client, req.body.email, false);
+    res.status(200).send(transactions);
+    return;
+  } catch (error) {
+    res.status(500).send(error);
+  }
 });
 
 app.get('/api/categories', async (req, res) => {
@@ -625,7 +630,7 @@ app.post("/api/login", async (req, res) => {
 app.put('/api/user', async (req, res) => {
   if (!req.body.email || !req.body.password || !req.body.firstName || !req.body.lastName) {
     res.status(400).send({
-      "msg": "Must include all necessary info!"
+      "msg": "Must include email, password, firstName, and lastName"
     });
     return;
   }
@@ -696,64 +701,34 @@ app.delete('/api/user', async (req, res) => {
 app.post('/api/checklist', async (req, res) => {
   if (!req.body.email || !req.body.checklist) {
     res.status(400).send({
-      "msg": "Must include all necessary the email and checklist"
+      "msg": "Must include email and checklist"
     });
     return;
   }
-
-  const getParams = {
-    TableName: "AstroDart.Users",
-    Key: {
-      "UserId": {
-        S: req.body.email
-      }
+  try {
+    const data = await updateUserChecklist(dynamodb, req.body.email, req.body.checklist);
+    if (data === "Account not found") {
+      res.status(500).send({
+        "msg": "There was an error in the server when bringing up your account. Please try again later."
+      });
+      return;
     }
-  };
-  
-  const item = await dynamodb.getItem(getParams, (err, data) => {
-    if (err) {
-      console.error("Error when getting user:", err);
-      return undefined;
-    } else {
-      return data.Item;
+    else if (data === "Failed") {
+      res.status(500).send({
+        "msg": "There was an error in the server when trying to update your checklist. Please try again later."
+      });
+      return;
     }
-  }).promise();
-
-  if (Object.keys(item).length === 0) {
-    res.status(200).send({
-      "msg": "There is already an accont registered with this email!"
-    });
-    return;
-  }
-
-  const updateParams = {
-    TableName: 'AstroDart.Users',
-    Key: {
-      "UserId": {"S": req.body.email}
-    },
-    UpdateExpression: "set Checklist = :x",
-    ExpressionAttributeValues: {
-      ":x": { "M": req.body.checklist }
+    else if (data === "Successful") {
+      res.status(200).send({
+        "msg": "Updated checklist successfully"
+      });
+      return;
     }
-  };
-
-  const successful = await dynamodb.updateItem(updateParams, (err, data) => {
-    if (err) {
-      console.error("Error encountered:", err);
-      return false;
-    } else {
-      return true;
-    }
-  }).promise();
-
-  if (!successful) {
+    throw new Error("An unexpected outcome occurred when updating a user's checklist");
+  } catch (error) {
     res.status(500).send({
-      "msg": "Error while updating the checklist!"
-    });
-  }
-  else {
-    res.status(200).send({
-      "msg": "Checklist update successful"
+      "msg": "There was an unexpected error in the server. " + error
     });
   }
 });
@@ -762,127 +737,39 @@ app.post('/api/checklist', async (req, res) => {
 app.post('/api/items', async (req, res) => {
   if (!req.body.email || !req.body.items) {
     res.status(400).send({
-      "msg": "Must include all necessary the email and items"
+      "msg": "Must include email and items"
     });
     return;
   }
 
-  const getParams = {
-    TableName: "AstroDart.Users",
-    Key: {
-      "UserId": {
-        S: req.body.email
-      }
+  try {
+    const data = await updateUserItems(dynamodb, req.body.email, req.body.items);
+    if (data === "Account not found") {
+      res.status(500).send({
+        "msg": "There was an error in the server when bringing up your account. Please try again later."
+      });
+      return;
     }
-  };
-  
-  const item = await dynamodb.getItem(getParams, (err, data) => {
-    if (err) {
-      console.error("Error when getting user:", err);
-      return undefined;
-    } else {
-      return data.Item;
+    else if (data === "Failed") {
+      res.status(500).send({
+        "msg": "There was an error in the server when trying to update your items. Please try again later."
+      });
+      return;
     }
-  }).promise();
-
-  if (Object.keys(item).length === 0) {
-    res.status(200).send({
-      "msg": "Could not find account with this email"
-    });
-    return;
-  }
-
-  const updateParams = {
-    TableName: 'AstroDart.Users',
-    Key: {
-      "UserId": {"S": req.body.email}
-    },
-    UpdateExpression: "set LinkedItems = :x",
-    ExpressionAttributeValues: {
-      ":x": { "M": req.body.items }
+    else if (data === "Successful") {
+      res.status(200).send({
+        "msg": "Updated items successfully"
+      });
+      return;
     }
-  };
-
-  const successful = await dynamodb.updateItem(updateParams, (err, data) => {
-    if (err) {
-      console.error("Error encountered:", err);
-      return false;
-    } else {
-      return true;
-    }
-  }).promise();
-
-  if (!successful) {
+  } catch (error) {
     res.status(500).send({
-      "msg": "Error updating the items!"
-    });
-  }
-  else {
-    res.status(200).send({
-      "msg": "Items update successful"
+      "msg": "There was an unexpected error in the server. " + error
     });
   }
 });
 
 app.listen(process.env.PORT || 5000, () => console.log("server starting on port 5000!"));
-
-const getTransactionsForUser = async (dynamodb, client, email, previousMonth = false) => {
-  const getParams = {
-    TableName: "AstroDart.Users",
-    Key: {
-      "UserId": {
-        S: email
-      }
-    }
-  };
-  
-  const item = await dynamodb.getItem(getParams, (err, data) => {
-    if (err) {
-      console.error("Error when getting item:", err);
-      return undefined;
-    } else {
-      return data.Item;
-    }
-  }).promise();
-
-  const linkedItems = item.Item.LinkedItems.M;
-  const promiseArray = [];
-  const itemKeys = Object.keys(linkedItems);
-  itemKeys.forEach((itemKey) => {
-    const accessToken = linkedItems[itemKey].M.access_token.S;
-    if (linkedItems[itemKey].M.product.S === "auth" || linkedItems[itemKey].M.product.S === "liabilities") {
-      promiseArray.push(new Promise(async (resolve, reject) => {
-        try {
-          const transactions = await getTransactions(client, accessToken, previousMonth);
-          resolve(transactions);
-        } catch (error) {
-          console.error("Error occured when getting the transactions. The error is below.");
-          console.error(error);
-        }
-      }));
-    }
-  });
-
-  const transactionsData = (await Promise.all(promiseArray)).flat();
-  // Go through all of transactions. If the account Id is not in the user's data or it's a credit card payment, then remove it from the data array
-  const accountsArray = getAccountsArray(linkedItems);
-  const accountKeys = [];
-  let userHasCreditAccount = false;
-  accountsArray.forEach((account) => {
-    switch (account.type.S) {
-      case 'credit':
-        userHasCreditAccount = true;
-      case 'depository':
-        accountKeys.push(account.accountId.S);
-        break;
-    }
-  });
-  const filteredTransactionsData = transactionsData.filter((transaction) => {
-    return userHasCreditAccount ? accountKeys.includes(transaction.account_id) && !transaction.category.includes("Credit Card") : accountKeys.includes(transaction.account_id);
-  });
-  const finalTransactionsData = filteredTransactionsData.sort((a, b) => Date.parse(b.date) - Date.parse(a.date));
-  return finalTransactionsData;
-};
 
 // This is a helper function to authorize and create a Transfer after successful
 // exchange of a public_token for an access_token. The TRANSFER_ID is then used

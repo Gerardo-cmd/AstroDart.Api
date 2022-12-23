@@ -1,6 +1,12 @@
-import env from "dotenv";
 import jsSHA from "jssha";
 
+/**
+ * Will delete the user as well as all of the user's data from the database.
+ * @param {*} dynamodb AWS.DynamoDB
+ * @param {*} email String
+ * @param {*} password String
+ * @returns A promise to get either a string containing the result or an object with the respective data if the action was successful.
+ */
 const deleteUser = async (dynamodb, email, password) => {
   const getParams = {
     TableName: "AstroDart.Users",

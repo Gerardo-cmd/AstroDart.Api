@@ -1,10 +1,13 @@
-import env from "dotenv";
 import jsSHA from "jssha";
 import jwt from "jsonwebtoken";
 
-// Load in .ENV file contents
-env.config();
-
+/**
+ * Will verify the credentials given to authorize login.
+ * @param {*} dynamodb AWS.DynamoDB
+ * @param {*} email String
+ * @param {*} password String
+ * @returns A promise to get either a string containing the result or an object with the respective data if the action was successful.
+ */
 const login = async (dynamodb, email, password) => {
   const getParams = {
     TableName: "AstroDart.Users",

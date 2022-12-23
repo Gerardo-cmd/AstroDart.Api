@@ -2,7 +2,7 @@
  * Will return the data for one investment item/account.This is mainly for investment accounts.
  * @param {*} client PlaidApi
  * @param {*} accessToken String
- * @returns An object containing data on the item/account
+ * @returns A promise to get an object containing data on the item/account
  */
 const getInvestments = async (client, accessToken) => {
   try {
