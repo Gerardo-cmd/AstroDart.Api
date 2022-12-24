@@ -50,7 +50,7 @@ const getItemTransactions = async (client, accessToken, getPreviousMonth = false
         paginatedResponse.data.transactions,
       );
     }
-    return transactions;
+    return transactions.filter((transaction) => transaction.amount > 0);
   } catch (error) {
     throw new Error(error);
   }

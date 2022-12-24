@@ -119,6 +119,7 @@ const saveMonthlySpendingForAllUsers = async () => {
 
         // Remember to get the data from the previous month
         const transactions = await getAllTransactionsForUser(dynamodb, client, email, true);
+
         // Sum up transactions to get total for each category as well as total overall
         const categoriesObject = {};
         const categories = new Map();
@@ -136,11 +137,14 @@ const saveMonthlySpendingForAllUsers = async () => {
       
         let total = 0;
         categories.forEach((amount, category) => {
-          categoriesObject[category] = { "M": {
-            "Amount": { "N": amount.toString()},
-            "Category": { "S": category } 
-          }};
-          total += amount;
+          // We don't want negative transactions That doesn't count as spending
+          if (amount > 0) {
+            categoriesObject[category] = { "M": {
+              "Amount": { "N": amount.toString()},
+              "Category": { "S": category } 
+            }};
+            total += amount;
+          }
         });
         categoriesObject["Overall"] = { "N": total.toString() };
 
@@ -328,7 +332,7 @@ const updateAllBalances = async () => {
   }
 };
 
-const getNetworth = async () => {
+const markAllNetworths = async () => {
   const date = new Date();
   const params = {
     TableName: "AstroDart.Users",
@@ -422,7 +426,7 @@ const getNetworth = async () => {
 
 cron.schedule('0 9 1 * *', () => {
   console.log('Marking all users\'s networth At 09:00 AM on the first day of every month');
-  getNetworth();
+  markAllNetworths();
 });
 
 cron.schedule('0 8,17 * * *', () => {
@@ -436,7 +440,7 @@ cron.schedule('0 1 1 * *', () => {
   saveMonthlySpendingForAllUsers();
 });
 
-app.get('/api/info', function (req, res) {
+app.get('/api/info', (req, res) => {
   res.status(200).send({
     item_id: ITEM_ID,
     access_token: ACCESS_TOKEN,
