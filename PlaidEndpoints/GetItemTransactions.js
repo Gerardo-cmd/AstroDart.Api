@@ -1,3 +1,4 @@
+import { Categories } from "../constants.js";
 /**
  * Will return the data for one item/account of any type (?). This is should mainly be used for depository accounts and credit card accounts.
  * @param {*} client PlaidApi
@@ -50,6 +51,12 @@ const getItemTransactions = async (client, accessToken, getPreviousMonth = false
         paginatedResponse.data.transactions,
       );
     }
+    // Modify categories to match our constant categories
+    transactions.forEach((transaction) => {
+      if (!Categories.includes(transaction.category[0])) {
+        transaction.category = ["Other"];
+      }
+    })
     return transactions.filter((transaction) => transaction.amount > 0);
   } catch (error) {
     throw new Error(error);
