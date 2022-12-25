@@ -25,7 +25,11 @@ import deleteUser from './CustomEndpoints/DeleteUser.js';
 import updateUserChecklist from './CustomEndpoints/UpdateUserChecklist.js';
 import updateUserItems from './CustomEndpoints/UpdateUserItems.js';
 
-import { getAccountsArray } from "./utils.js";
+/** Background Jobs */
+import markAllNetworths from './BackgroundJobs/MarkAllNetworths.js';
+import saveMonthlySpendingForAllUsers from './BackgroundJobs/SaveMonthlySpendingForAllUsers.js';
+import updateAllBalances from './BackgroundJobs/UpdateAllBalances.js';
+
 
 const app = express();
 
@@ -80,364 +84,20 @@ const configuration = new Configuration({
 
 const client = new PlaidApi(configuration);
 
-const saveMonthlySpendingForAllUsers = async () => {
-  const date = new Date();
-  const params = {
-    TableName: "AstroDart.Users",
-  };
-  const users = [];
-  let items;
-
-  do{
-    items = await dynamodb.scan(params).promise();
-    items.Items.forEach((item) => users.push(item));
-    params.ExclusiveStartKey  = items.LastEvaluatedKey;
-  }while(typeof items.LastEvaluatedKey !== "undefined");
-
-  const userPromiseArray = [];
-  users.map((user) => {
-    const email = user.UserId.S;
-    userPromiseArray.push(new Promise(async (resolve, reject) => {
-      try {
-        const getParams = {
-          TableName: "AstroDart.Users",
-          Key: {
-            "UserId": {
-              S: email
-            }
-          }
-        };
-        
-        const userItem = await dynamodb.getItem(getParams, (err, data) => {
-          if (err) {
-            console.error("Error when getting user:", err);
-            return undefined;
-          } else {
-            return data.Item;
-          }
-        }).promise();
-
-        // Remember to get the data from the previous month
-        const transactions = await getAllTransactionsForUser(dynamodb, client, email, true);
-
-        // Sum up transactions to get total for each category as well as total overall
-        const categoriesObject = {};
-        const categories = new Map();
-
-        transactions.forEach((transaction) => {
-          const category = transaction.category[0] === "Payment" && transaction.category.length > 1 ? transaction.category[1] : transaction.category[0]
-          if (categories.has(category))  {
-            const oldValue = categories.get(category);
-            categories.set(category, oldValue + transaction.amount);
-          }
-          else {
-            categories.set(category, transaction.amount);
-          }
-        });
-      
-        let total = 0;
-        categories.forEach((amount, category) => {
-          // We don't want negative transactions That doesn't count as spending
-          if (amount > 0) {
-            categoriesObject[category] = { "M": {
-              "Amount": { "N": amount.toString()},
-              "Category": { "S": category } 
-            }};
-            total += amount;
-          }
-        });
-        categoriesObject["Overall"] = { "N": total.toString() };
-
-        // Save data in the database
-        const monthlySpendingKeys = Object.keys(userItem.Item.MonthlySpending?.M);
-        
-        let newMonthlySpending;
-        // We only want the previous two months, so if we have already have two, 
-        // then create the new one while getting rid of the oldest one
-        if (monthlySpendingKeys.length === 2) {
-          newMonthlySpending = {};
-          newMonthlySpending["0"] = userItem.Item.MonthlySpending.M["1"];
-          // Remember that we are using last month's data
-          newMonthlySpending["1"] = {
-            "M": {
-              "Date": { "S": (date.getMonth()) + "-" + date.getFullYear() },
-              "Spending": { 
-                "M": categoriesObject 
-              }
-            }
-          };
-        }
-        // If there is 1 month or no data recorded
-        else {
-          newMonthlySpending = userItem.Item.MonthlySpending.M;
-          // Remember that we are using last month's data
-          newMonthlySpending[monthlySpendingKeys.length.toString()] = {
-            "M": {
-              "Date": { "S": (date.getMonth()) + "-" + date.getFullYear() },
-              "Spending": { 
-                "M": categoriesObject 
-              }
-            } 
-          };
-        }
-
-        const updateParams = {
-          TableName: 'AstroDart.Users',
-          Key: {
-            "UserId": {"S": email}
-          },
-          UpdateExpression: "set MonthlySpending = :x",
-          ExpressionAttributeValues: {
-            ":x": { 
-              "M": newMonthlySpending 
-            }
-          }
-        };
-      
-        const successful = await dynamodb.updateItem(updateParams, (err, data) => {
-          if (err) {
-            console.error("Error encountered:", err);
-            return false;
-          } else {
-            return true;
-          }
-        }).promise();
-        resolve(successful);
-      } catch (error) {
-        console.error("There was an error when getting the transactions for one user. The error is below.");
-        console.error(error);
-      }
-    }));
-  });
-
-  Promise.all(userPromiseArray).then((results) => {
-    console.log("Successfully saved monthly spending totals for all users");
-  }).catch((error) => {
-    console.error("Something went wrong when saving monthly spending amounts for all users. None were saved as a result. The error is below");
-    console.error(error);
-  });
-};
-
-const updateAllBalances = async () => {
-  // Go through every user
-  const params = {
-    TableName: "AstroDart.Users",
-  };
-
-  const userPromiseArray = [];
-  const users = [];
-  let items;
-
-  do{
-    items =  await dynamodb.scan(params).promise();
-    items.Items.forEach((item) => users.push(item));
-    params.ExclusiveStartKey  = items.LastEvaluatedKey;
-  }while(typeof items.LastEvaluatedKey !== "undefined");
-
-  // Go through every item
-  users.map((user) => {
-    const userId = user.UserId.S;
-    const itemPromiseArray = [];
-    const itemKeys = Object.keys(user.LinkedItems.M);
-
-    const newItems = user.LinkedItems.M;
-
-    itemKeys.forEach((item) => {
-      // Call the api/balance/get endpoint below to get the latest balances
-      const accessToken = user.LinkedItems.M[item].M.access_token.S;
-      const accountKeys = Object.keys(user.LinkedItems.M[item].M.accounts.M);
-      const itemId = user.LinkedItems.M[item].M.item_id.S;
-      const institutionId = user.LinkedItems.M[item].M.institution_id.S;
-      const product = user.LinkedItems.M[item].M.product.S;
-
-      itemPromiseArray.push(new Promise(async (resolve, reject) => {
-        const request = {
-          access_token: accessToken,
-        };
-        const response = await client.accountsBalanceGet(request);
-        const accounts = response.data.accounts;
-
-        const getParams = {
-          TableName: "AstroDart.Users",
-          Key: {
-            "UserId": {
-              S: userId
-            }
-          }
-        };
-
-        const accountsForThisItem = {};
-        accounts.forEach((account) => {
-          // Only copy the current balance if it exists in the user's data. Otherwise, skip over it
-          if (accountKeys.includes(account.account_id)) {
-            accountsForThisItem[account.account_id] = {
-              M: {
-                accountId: { S: account.account_id},
-                name: { S: account.name},
-                balance: { N: account.balances.current.toString()},
-                item_id: { S: itemId },
-                type: { S: account.type}
-              }
-            };
-          }
-        });
-
-        // Update the value with the new accounts but keep everything else tha same
-        newItems[itemId] = {
-          M: {
-            institution_id: { S: institutionId },
-            access_token: { S: accessToken },
-            item_id: { S: itemId },
-            accounts: { M: accountsForThisItem },
-            product: { S: product }
-          }
-        };
-        const updateParams = {
-          TableName: 'AstroDart.Users',
-          Key: {
-            "UserId": { "S": userId }
-          },
-          UpdateExpression: "set LinkedItems = :x",
-          ExpressionAttributeValues: {
-            ":x": { "M": newItems }
-          }
-        };
-      
-        const successful = await dynamodb.updateItem(updateParams, (err, data) => {
-          if (err) {
-            console.error("Error encountered:", err);
-            return false;
-          } else {
-            return true;
-          }
-        }).promise();
-  
-        resolve(successful);
-      }));
-    });
-
-    userPromiseArray.push(itemPromiseArray);
-  });
-
-  for (let index = 0; index < userPromiseArray.length; index++) {
-    // Iterate over every user
-    const promiseArray = userPromiseArray[index];
-    // Complete the promise array for the current user
-    Promise.all(promiseArray).then((results) => {
-      console.log("Successfully updated all balances for one user")
-    }).catch((error) => {
-      console.error("Something went wrong when updating all balances. None were updated as a result. The error is below");
-      console.error(error);
-    });
-  }
-};
-
-const markAllNetworths = async () => {
-  const date = new Date();
-  const params = {
-    TableName: "AstroDart.Users",
-  };
-  const promiseArray = [];
-  const users = [];
-  let items;
-
-  do{
-    items = await dynamodb.scan(params).promise();
-    items.Items.forEach((item) => users.push(item));
-    params.ExclusiveStartKey  = items.LastEvaluatedKey;
-  }while(typeof items.LastEvaluatedKey !== "undefined");
-
-  users.map((user) => {
-    let currentNetworth = 0;
-    const items = user.LinkedItems?.M;
-
-    // Will return an empty array if there are no items
-    const accountsArray = getAccountsArray(items);
-    accountsArray.forEach((account) => {
-      let accountBalance = parseFloat(account.balance.N);
-      if (account.type.S === "credit") {
-        accountBalance *= -1;
-      }
-      currentNetworth += accountBalance;
-    });
-
-    promiseArray.push(new Promise(async (resolve, reject) => {
-      const getParams = {
-        TableName: "AstroDart.Users",
-        Key: {
-          "UserId": {
-            S: user.UserId.S
-          }
-        }
-      };
-      
-      const userItem = await dynamodb.getItem(getParams, (err, data) => {
-        if (err) {
-          console.error("Error when getting user:", err);
-          return undefined;
-        } else {
-          return data.Item;
-        }
-      }).promise();
-
-      const networthHistoryKeys = Object.keys(userItem.Item.NetworthHistory?.M);
-      const newNetworthHistory = userItem.Item.NetworthHistory.M;
-      newNetworthHistory[networthHistoryKeys.length.toString()] = {
-        "M": {
-          "Date": { "S": (date.getMonth() + 1) + "-" + date.getFullYear() },
-          "Networth": { "N": Math.floor(currentNetworth).toString() }
-        } 
-      };
-
-      const updateParams = {
-        TableName: 'AstroDart.Users',
-        Key: {
-          "UserId": {"S": user.UserId.S}
-        },
-        UpdateExpression: "set NetworthHistory = :x",
-        ExpressionAttributeValues: {
-          ":x": { 
-            "M": newNetworthHistory
-          }
-        }
-      };
-    
-      const successful = await dynamodb.updateItem(updateParams, (err, data) => {
-        if (err) {
-          console.error("Error encountered:", err);
-          return false;
-        } else {
-          return true;
-        }
-      }).promise();
-
-      resolve(successful);
-    }));
-  });
-
-  Promise.all(promiseArray).then((results) => {
-    console.log(`Successfully updated all user's networths!`);
-  })
-  .catch((error) => {
-    console.error("Something went wrong when saving the networth of each user. As a result, none were saved. The error is below.");
-    console.log(error);
-  });
-};
-
-cron.schedule('0 9 1 * *', () => {
+cron.schedule('0 9 1 * *', async () => {
   console.log('Marking all users\'s networth At 09:00 AM on the first day of every month');
-  markAllNetworths();
+  await markAllNetworths(dynamodb);
 });
 
-cron.schedule('0 8,17 * * *', () => {
+cron.schedule('0 8,17 * * *', async () => {
   console.log('Updating all balances At 08:00 AM and 5:00 PM every day');
-  updateAllBalances();
+  await updateAllBalances(dynamodb, client);
 });
 
 // Read whole table, read each user once, and write to each user once Change this to reade the data from last month!
-cron.schedule('0 1 1 * *', () => {
+cron.schedule('0 1 1 * *', async () => {
   console.log('Marking all users\'s spending for the previous month At 01:00 AM on the first day of every month');
-  saveMonthlySpendingForAllUsers();
+  await saveMonthlySpendingForAllUsers(dynamodb, client);
 });
 
 app.get('/api/info', (req, res) => {
@@ -655,7 +315,6 @@ app.put('/api/user', async (req, res) => {
     });
   }
 });
-
 
 // An endpoint for deleting users
 app.delete('/api/user', async (req, res) => {
