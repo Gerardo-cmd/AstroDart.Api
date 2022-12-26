@@ -94,7 +94,7 @@ cron.schedule('0 8,17 * * *', async () => {
   await updateAllBalances(dynamodb, client);
 });
 
-// Read whole table, read each user once, and write to each user once Change this to reade the data from last month!
+// Read whole table, read each user once, and write to each user once Change this to read the data from last month!
 cron.schedule('0 1 1 * *', async () => {
   console.log('Marking all users\'s spending for the previous month At 01:00 AM on the first day of every month');
   await saveMonthlySpendingForAllUsers(dynamodb, client);
